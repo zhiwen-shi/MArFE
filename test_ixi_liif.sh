@@ -1,0 +1,21 @@
+# 测试 IXI 数据集
+python main.py --n_GPUs=1  \
+               --num_GPUs='6'  \
+               --data_train='RefMRI' \
+               --name_train='T2mattrain' \
+               --data_test='RefMRI' \
+               --name_test='T2mattest' \
+               --dir_data='/media/data1/shizw/MICCAIData'  \
+               --resume=0  \
+               --n_color=2 \
+               --rgb_range=1 \
+               --pre_train="./experiment/hiif_IXI_unfold/model/model_best.pt" \
+               --test_only \
+               --scale="1.5+2+3+4+6+8" \
+               --model="hiif"  \
+               --ref_type_test=1 \
+               --ref_mat='IXIPDrefmat' \
+               --ref_list='multinameIXI.txt' \
+               --save_results \
+               --savefigfilename="IXI_hiif_unfold" \
+               --mode=None

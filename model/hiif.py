@@ -1,0 +1,448 @@
+# import os
+# os.environ['CUDA_VISIBLE_DEVICES'] = '6'
+# import time
+# from thop import profile
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from model import common
+from model.rdn import make_rdn
+from model.resblock import ResBlock
+
+# import common
+# from rdn import make_rdn
+# from resblock import ResBlock
+
+def make_model(args, parent=False):
+    return HIIF(args)
+
+def compute_hi_coord(coord, n):
+    coord_clip = torch.clip(coord - 1e-9, 0., 1.)
+    coord_bin = ((coord_clip * 2 ** (n + 1)).floor() % 2)
+    return coord_bin
+
+class MLP(nn.Module):
+    def __init__(self, in_dim, out_dim, hidden_dim, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_dim, out_dim)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+class MLP_with_shortcut(nn.Module):
+    def __init__(self, in_dim, out_dim, hidden_dim, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        self.norm = nn.LayerNorm(in_dim)
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_dim, out_dim)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        short_cut = x
+        x = self.norm(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        if x.shape[-1] == short_cut.shape[-1]:
+            x = x + short_cut
+        return x
+
+class qkv_attn(nn.Module):
+    def __init__(self, midc, heads):
+        super().__init__()
+
+        self.headc = midc // heads
+        self.heads = heads
+        self.midc = midc
+
+        self.qkv_proj = nn.Linear(midc, midc * 3, bias=True)
+
+        self.kln = nn.LayerNorm(self.headc)
+        self.vln = nn.LayerNorm(self.headc)
+        self.sm = nn.Softmax(dim=-1)
+
+        self.proj1 = nn.Linear(midc, midc)
+        self.proj2 = nn.Linear(midc, midc)
+
+        self.proj_drop = nn.Dropout(0.)
+
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        B, HW, C = x.shape
+        bias = x
+
+        qkv = self.qkv_proj(x).reshape(B, HW, self.heads, 3 * self.headc)
+        qkv = qkv.permute(0, 2, 1, 3)
+        q, k, v = qkv.chunk(3, dim=-1) # B, heads, HW, headc
+
+        k = self.kln(k)
+        v = self.vln(v)
+
+        v = torch.matmul(k.transpose(-2, -1), v) / (HW)
+        # v = self.sm(v)
+        v = torch.matmul(q, v)
+        v = v.permute(0, 2, 1, 3).reshape(B, HW, C)
+
+        ret = v + bias
+        bias = self.proj2(self.act(self.proj1(ret))) + bias
+
+        return bias
+def make_coord(shape, ranges=None, flatten=True):
+    """ Make coordinates at grid centers.
+    """
+    coord_seqs = []
+    for i, n in enumerate(shape):
+        if ranges is None:
+            v0, v1 = -1, 1
+        else:
+            v0, v1 = ranges[i]
+        r = (v1 - v0) / (2 * n)
+        seq = v0 + r + (2 * r) * torch.arange(n).float()
+        coord_seqs.append(seq)
+    # ret = torch.stack(torch.meshgrid(*coord_seqs), dim=-1)
+    ret = torch.stack(torch.meshgrid(*coord_seqs,indexing='ij'), dim=-1)
+    if flatten:
+        ret = ret.view(-1, ret.shape[-1])  # h*w ,2
+    return ret  # h, w, 2
+
+
+class RDB(nn.Module):
+    def __init__(self, growRate0, growRate, nConvLayers, kSize=3):
+        super(RDB, self).__init__()
+        G0 = growRate0
+        G = growRate
+        C = nConvLayers
+
+        convs = []
+        for c in range(C):
+            convs.append(RDB_Conv(G0 + c * G, G))
+        self.convs = nn.Sequential(*convs)
+
+        # Local Feature Fusion
+        self.LFF = nn.Conv2d(G0 + C * G, G0, 1, padding=0, stride=1)
+
+    def forward(self, x):
+        return self.LFF(self.convs(x)) + x
+
+class RDB_Conv(nn.Module):
+    def __init__(self, inChannels, growRate, kSize=3):
+        super(RDB_Conv, self).__init__()
+        Cin = inChannels
+        G = growRate
+        self.conv = nn.Sequential(*[
+            nn.Conv2d(Cin, G, kSize, padding=(kSize - 1) // 2, stride=1),
+            nn.ReLU()
+        ])
+
+    def forward(self, x):
+        out = self.conv(x)
+        return torch.cat((x, out), 1)
+
+class RDN(nn.Module):
+    def __init__(self, args, conv=common.default_conv):
+        super(RDN, self).__init__()
+        r = args.scale[0]
+        G0 = 64
+        kSize = 3
+
+        # number of RDB blocks, conv layers, out channels
+        self.D, C, G = {
+            'A': (20, 6, 32),
+            'B': (16, 8, 64),
+        }['B']
+
+        self.out_dim = G0
+
+        self.sub_mean = nn.Identity()
+        self.add_mean = nn.Identity()
+
+        # Shallow feature extraction net
+        self.SFENet1 = nn.Conv2d(2, G0, kSize, padding=(kSize - 1) // 2, stride=1)
+        self.SFENet2 = nn.Conv2d(G0, G0, kSize, padding=(kSize - 1) // 2, stride=1)
+
+        # Redidual dense blocks and dense feature fusion
+        self.RDBs = nn.ModuleList()
+        for i in range(self.D):
+            self.RDBs.append(
+                RDB(growRate0=G0, growRate=G, nConvLayers=C)
+            )
+
+        # Global Feature Fusion
+        self.GFF = nn.Sequential(*[
+            nn.Conv2d(self.D * G0, G0, 1, padding=0, stride=1),
+            nn.Conv2d(G0, G0, kSize, padding=(kSize - 1) // 2, stride=1)
+        ])
+
+
+    def forward(self, x):
+        f__1 = self.SFENet1(x)
+        x = self.SFENet2(f__1)
+
+        RDBs_out = []
+        for i in range(self.D):
+            x = self.RDBs[i](x)
+            RDBs_out.append(x)
+
+        x = self.GFF(torch.cat(RDBs_out, 1))
+        x += f__1
+
+        return x
+
+# class MLP(nn.Module):
+
+#     def __init__(self, in_dim, out_dim, hidden_list):
+#         super().__init__()
+#         layers = []
+#         lastv = in_dim
+#         for hidden in hidden_list:
+#             layers.append(nn.Linear(lastv, hidden))
+#             layers.append(nn.ReLU())
+#             lastv = hidden
+#         layers.append(nn.Linear(lastv, out_dim))
+#         self.layers = nn.Sequential(*layers)
+
+#     def forward(self, x):
+#         shape = x.shape[:-1]
+#         x = self.layers(x.view(-1, x.shape[-1]))
+#         return x.view(*shape, -1)
+
+class HIIF(nn.Module):
+    def __init__(self, args,
+                 local_ensemble=True, feat_unfold=True, cell_decode=True):
+        super().__init__()
+        self.local_ensemble = local_ensemble
+        self.feat_unfold = False  # False not c*9  or True c*9
+        self.cell_decode = cell_decode
+
+        # self.encoder = make_rdn()
+        self.encoder = RDN(args)
+
+        # imnet_in_dim = self.encoder.out_dim
+        # if self.feat_unfold:
+        #     imnet_in_dim *= 9
+        # imnet_in_dim += 2 # attach coord
+        # if self.cell_decode:
+        #     imnet_in_dim += 2
+        # self.imnet = MLP(in_dim = imnet_in_dim, out_dim=2, hidden_list=[256, 256, 256, 256]) 
+
+        self.mixer = nn.Conv2d(64*2, 64, 1, padding=0, stride=1)
+      
+        
+        # for hiif
+        hidden_dim=256
+        blocks = 16
+        self.freq = nn.Conv2d(self.encoder.out_dim, hidden_dim, 3, padding=1)
+        self.n_hi_layers = 6
+        # self.fc_layers = nn.ModuleList(
+        #     [
+        #         MLP_with_shortcut(64*9 * 4 + 2 + 2 if d == 0 else hidden_dim + 2,
+        #                           2 if d == self.n_hi_layers - 1 else hidden_dim, 256) \
+        #         for d in range(self.n_hi_layers)
+        #     ]
+        # )
+        self.fc_layers = nn.ModuleList(
+            [
+                MLP_with_shortcut(hidden_dim * 4 + 2 + 2 if d == 0 else hidden_dim + 2,
+                                  2 if d == self.n_hi_layers - 1 else hidden_dim, 256) \
+                for d in range(self.n_hi_layers)
+            ]
+        )
+
+        self.conv0 = qkv_attn(hidden_dim, blocks)
+        self.conv1 = qkv_attn(hidden_dim, blocks)
+
+
+        # self.conv00 = nn.Conv2d((64*9 + 2)*4+2, self.width, 1)
+        # self.conv0 = simple_attn(self.width, blocks)
+        # self.conv1 = simple_attn(self.width, blocks)
+        # self.fc1 = nn.Conv2d(self.width, 256, 1)
+        # self.fc2 = nn.Conv2d(256, 2, 1)
+
+    def set_scale(self, scale, scale2):
+        self.scale = scale
+        self.scale2 = scale2
+
+    def query_rgb(self, coord, cell, input):
+        # feat = self.feat
+        feat = self.freq(self.feat)  # 16 256 48 48 bchw  for ori hiif
+        grid = 0
+        input = input
+
+        # if self.imnet is None:
+        #     ret = F.grid_sample(feat, coord.flip(-1).unsqueeze(1),
+        #         mode='nearest', align_corners=False)[:, :, 0, :] \
+        #         .permute(0, 2, 1)
+        #     # print(F.grid_sample(feat, coord.flip(-1).unsqueeze(1),mode='nearest', align_corners=False).shape,ret.shape)  None
+        #     return ret
+
+        if self.feat_unfold:
+            feat = F.unfold(feat, 3, padding=1).view(
+                feat.shape[0], feat.shape[1] * 9, feat.shape[2], feat.shape[3]) #16,576,48,48  64*9=576
+
+
+        if self.local_ensemble:
+            vx_lst = [-1, 1]
+            vy_lst = [-1, 1]
+            eps_shift = 1e-6
+        else:
+            vx_lst, vy_lst, eps_shift = [0], [0], 0
+
+        # field radius (global: [-1, 1])
+        rx = 2 / feat.shape[-2] / 2 #1/48
+        ry = 2 / feat.shape[-1] / 2
+
+        feat_coord = make_coord(feat.shape[-2:], flatten=False).cuda() \
+            .permute(2, 0, 1) \
+            .unsqueeze(0).expand(feat.shape[0], 2, *feat.shape[-2:])
+        # print(make_coord(feat.shape[-2:], flatten=False).shape,feat_coord.shape) #48,48,2   2,48,48   1,2,48,48   16,2,48,48
+    
+        preds = []
+        areas = []
+        for vx in vx_lst:
+            for vy in vy_lst:
+                coord_ = coord.clone() #16,48,48,2
+                coord_[:, :, :, 0] += vx * rx + eps_shift
+                coord_[:, :, :, 1] += vy * ry + eps_shift
+                coord_.clamp_(-1 + 1e-6, 1 - 1e-6)
+                q_feat = F.grid_sample(feat, coord_.flip(-1),mode='nearest', align_corners=False) #16,c,h,w c= 576
+                q_coord = F.grid_sample(feat_coord, coord_.flip(-1),mode='nearest', align_corners=False) #16,2,h,w
+                rel_coord = coord.permute(0, 3, 1, 2) - q_coord #16, 2, h, w
+                rel_coord[:, 0, :, :] *= feat.shape[-2] / 2
+                rel_coord[:, 1, :, :] *= feat.shape[-1] / 2 #16, 2, h, w
+                rel_coord_n = rel_coord.permute(0, 2, 3, 1).reshape(rel_coord.shape[0], -1, rel_coord.shape[1]) # b h*w 2
+
+                area = torch.abs(rel_coord[:, 0, :, :] * rel_coord[:, 1, :, :]) # 16, h, w
+                areas.append(area + 1e-9)
+
+                preds.append(q_feat)
+
+                if vx == -1 and vy == -1:
+                    # Local coord
+                    rel_coord_mask = (rel_coord_n > 0).float()
+                    rxry = torch.tensor([rx, ry], device=coord.device)[None, None, :]
+                    local_coord = rel_coord_mask * rel_coord_n + (1. - rel_coord_mask) * (rxry - rel_coord_n)
+
+        if self.cell_decode:
+            rel_cell = cell.clone()  # 16,2
+            rel_cell[:, 0] *= feat.shape[-2]
+            rel_cell[:, 1] *= feat.shape[-1] #16,2
+            rel_cell = rel_cell.to(feat.device)
+            # inp = torch.cat([inp, rel_cell], dim=1) #16,2304,580
+        
+        tot_area = torch.stack(areas).sum(dim=0) #16,h,w
+        if self.local_ensemble:
+            t = areas[0]; areas[0] = areas[3]; areas[3] = t
+            t = areas[1]; areas[1] = areas[2]; areas[2] = t
+
+        for index, area in enumerate(areas):
+            preds[index] = preds[index] * (area / tot_area).unsqueeze(1)  # b, c, h, w
+        
+        grid = torch.cat([*preds,rel_cell.unsqueeze(-1).unsqueeze(-1).repeat(1,1,coord.shape[1],coord.shape[2])],dim=1)  # 16, c, h, w
+        B, C_g, H, W = grid.shape
+        grid = grid.permute(0, 2, 3, 1).reshape(B, H * W, C_g) # 16 1026 48 48 （256*4+2)
+
+        for n in range(self.n_hi_layers):
+            hi_coord = compute_hi_coord(local_coord, n)
+            if n == 0:
+                x = torch.cat([grid] + [hi_coord], dim=-1) # b h*w 256*4+2 + b h*w 2
+            else:
+                x = torch.cat([x] + [hi_coord], dim=-1)
+            x = self.fc_layers[n](x)
+            if n == 0:
+                x = self.conv0(x)
+                x = self.conv1(x)
+
+        result = x.permute(0, 2, 1).reshape(B, 2, H, W)
+        ret = result + F.grid_sample(input, coord.flip(-1), mode='bilinear', \
+                                  padding_mode='border', align_corners=False)
+
+        return ret  # 16, 2, h, w
+
+    def forward(self, inp, bsize = None): ##16,3,48,48  16,2304,2  16,2304,2
+        ref = inp[2]
+        inp = inp[0]
+        feat = self.encoder((inp-0.5)/0.5)
+        # self.feat = self.encoder((inp-0.5)/0.5)
+        with torch.no_grad():
+            ref = self.encoder((ref-0.5)/0.5)
+        feat = torch.cat([feat,ref],1)
+        self.feat = self.mixer(feat)  # multi_constract fusion
+
+
+        B,C,H,W = inp.shape
+        H_hr = round(H*self.scale)
+        W_hr = round(W*self.scale2)
+        coord = make_coord((H_hr,W_hr), flatten=False).repeat(B,1,1,1).to(inp.device) # b h w 2
+        cell = torch.tensor([2 / H_hr, 2 / W_hr], dtype=torch.float32)
+        cell = cell.unsqueeze(0).expand(B, 2)  # b,2
+
+
+        if bsize is not None:
+            n = coord.shape[1]
+            ql = 0
+            preds = []
+            while ql < n:
+                qr = min(ql + bsize, n)
+                pred = self.query_rgb(coord[:, ql: qr, :], cell[:, ql: qr, :], inp)
+                preds.append(pred)
+                ql = qr
+            pred = torch.cat(preds, dim=1)
+        else:
+            pred = self.query_rgb(coord, cell, inp)
+
+        return pred*0.5+0.5, pred*0.5+0.5
+
+
+# # cal para
+# if __name__ == '__main__':
+
+#     class Args:
+#         def __init__(self):
+#             self.scale = [2]  
+#             # self.scale2 = 2
+#             self.rgb_range = 1
+
+#     args = Args()
+#     model = HIIF(args)  # 2x or 4x or 6x
+#     model.set_scale(scale=2, scale2=2)
+
+#     model.eval()
+#     model.cuda()
+
+#     inp = torch.randn(1,2,64,64).cuda()
+#     refhr = torch.randn(1,2,64,64).cuda()  # 1,2,128,128  or 1,2,256,256
+#     reflr = torch.randn(1,2,64,64).cuda()
+#     input = (inp, refhr, reflr)
+    
+#     bufer_infer = 0
+
+#     with torch.no_grad():  # 关闭梯度追踪，释放显存
+#         for _ in range(5):  # warm up
+#             _ = model(input)
+#         for i in range(100):
+#             # print("inference time:", i)
+#             time_start = time.time()
+#             out = model(input)
+#             # print(out.shape)
+#             time_end = time.time()
+#             infer_time_ms = (time_end - time_start) * 1000  # 秒转毫秒
+#             bufer_infer += infer_time_ms
+
+#         avg_infer_time = bufer_infer / 100
+#         print(f'Avg Inference time: {avg_infer_time:.2f} ms')
+
+#     flops, params = profile(model, inputs=(input,))
+#     print('Model:{:.2f} GFLOPs and {:.2f}M parameters'.format(flops*2 / 1e9, params / 1e6))
